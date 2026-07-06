@@ -1,0 +1,53 @@
+# ===== ROS2 / colcon build artifacts =====
+build/
+install/
+log/
+
+# 개별 패키지 안에 build/install/log가 생기는 경우도 커버
+**/build/
+**/install/
+**/log/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# ===== C/C++ =====
+*.o
+*.obj
+*.so
+*.a
+*.out
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# ===== VSCode / IDE =====
+.vscode/
+*.code-workspace
+.idea/
+
+# ===== ROS bag 파일 =====
+*.bag
+*.db3
+rosbag2_*/
+
+# ===== 환경 설정 / 임시 파일 =====
+*.swp
+*.swo
+*~
+.DS_Store
+*.log
+
+# ===== 환경변수, 비밀키 =====
+.env
+*.pem
+*.key
+
+# ===== colcon 관련 =====
+.catkin_tools/
+COLCON_IGNORE
