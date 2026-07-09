@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import math
 import cv2
 import numpy as np
 import rclpy
@@ -44,7 +45,16 @@ DYN_WATCH_SEC     = 5.0   # 감시 시간 (초)
 DYN_FRONT_START   = 120   # -3도 idx
 DYN_FRONT_END     = 124   # +3도 idx
 
-# ===== LiDAR =====
+# ===== 고정 박스 장애물 회피 =====
+BOX_FRONT_ANGLE  = 70.0   # 전방 스캔 범위 절반 각도 (도)
+BOX_LANE_WIDTH   = 0.3    # 차선 폭 절반 (m)
+BOX_WARN_DIST    = 0.4    # 감지 거리 (m)
+OBS_AVOID_STEER  = 0.42   # 회피 조향각
+OBS_AVOID_SPEED  = 0.2    # 회피 속도
+OBS_RETURN_STEER = 0.42   # 복귀 조향각
+OBS_AVOID_SEC    = 1.0    # 회피 시간 (초)
+OBS_RETURN_SEC   = 2.0    # 복귀 시간 (초)
+OBS_START_DELAY  = 4.0    # 진입 후 감지 시작까지 대기 (초)
 WATCH_IDX_START = 113
 WATCH_IDX_END   = 228
 WATCH_DIST      = 1.5
@@ -67,14 +77,20 @@ def clamp(val, lo, hi):
 
 class Mission(Enum):
     WAIT_SIGNAL      = 0
-    DEFAULT_DRIVE    = 1
-    YELLOW_STOP      = 2
-    ROUNDABOUT_WAIT  = 3
-    ROUNDABOUT_DRIVE = 4
-    CONE_AVOIDING    = 5
-    CONE_HOLD        = 6
-    CONE_RETURN      = 7
-    PARKING          = 8
+    DEFAULT_DRIVE_1  = 1   # 신호등 ~ 동적장애물
+    YELLOW_STOP      = 2   # 동적 장애물 감시
+    OBSTACLE_AVOID   = 3   # 박스 회피 (방향은 파라미터)
+    OBSTACLE_RETURN  = 4   # 박스 회피 후 복귀
+    DEFAULT_DRIVE_2  = 5   # 복귀 후 ~ 교차로
+    ROUNDABOUT_WAIT  = 6
+    ROUNDABOUT_DRIVE = 7
+    CONE_AVOIDING    = 8
+    CONE_HOLD        = 9
+    CONE_RETURN      = 10
+    DEFAULT_DRIVE_3  = 11  # 콘 후 ~ 두 번째 박스
+    OBSTACLE_AVOID_2 = 12  # 두 번째 박스 회피
+    OBSTACLE_RETURN_2= 13  # 두 번째 박스 복귀
+    PARKING          = 14
 
 
 class MissionController(Node):
@@ -121,6 +137,7 @@ class MissionController(Node):
         # 라바콘
         self.cone_clear_count = 0
         self.avoid_dir        = None
+        self.obs_avoid_start  = None
 
         self.create_timer(1.0, self._log_state)
         self.get_logger().info('MissionController 시작 → WAIT_SIGNAL')
@@ -139,10 +156,16 @@ class MissionController(Node):
 
         if   self.state == Mission.WAIT_SIGNAL:
             self.handle_wait_signal(frame)
-        elif self.state == Mission.DEFAULT_DRIVE:
-            self.handle_default_drive(frame)
+        elif self.state == Mission.DEFAULT_DRIVE_1:
+            self.handle_default_drive_1(frame)
         elif self.state == Mission.YELLOW_STOP:
             self.handle_yellow_stop(frame)
+        elif self.state == Mission.OBSTACLE_AVOID:
+            self.handle_obstacle_avoid(frame, avoid_dir=1)   # 오른쪽 박스 → 왼쪽 회피
+        elif self.state == Mission.OBSTACLE_RETURN:
+            self.handle_obstacle_return(frame, return_dir=-1, next_state=Mission.DEFAULT_DRIVE_2)
+        elif self.state == Mission.DEFAULT_DRIVE_2:
+            self.handle_default_drive_2(frame)
         elif self.state == Mission.ROUNDABOUT_WAIT:
             self.handle_roundabout_wait(frame)
         elif self.state == Mission.ROUNDABOUT_DRIVE:
@@ -153,6 +176,12 @@ class MissionController(Node):
             self.handle_cone_hold(frame)
         elif self.state == Mission.CONE_RETURN:
             self.handle_cone_return(frame)
+        elif self.state == Mission.DEFAULT_DRIVE_3:
+            self.handle_default_drive_3(frame)
+        elif self.state == Mission.OBSTACLE_AVOID_2:
+            self.handle_obstacle_avoid(frame, avoid_dir=-1)  # 왼쪽 박스 → 오른쪽 회피
+        elif self.state == Mission.OBSTACLE_RETURN_2:
+            self.handle_obstacle_return(frame, return_dir=1, next_state=Mission.PARKING)
         elif self.state == Mission.PARKING:
             self.handle_parking(frame)
 
@@ -171,22 +200,85 @@ class MissionController(Node):
             self.get_logger().info(f'초록불 없음 area:{area}', throttle_duration_sec=1.0)
 
         if self.green_count >= STABLE_FRAMES:
-            self.transition_to(Mission.DEFAULT_DRIVE)
+            self.transition_to(Mission.DEFAULT_DRIVE_1)
         else:
             self.publish_stop()
 
     # ══════════════════════════════════════════════════════
-    # DEFAULT_DRIVE
+    # DEFAULT_DRIVE_1 : 신호등 ~ 동적장애물
     # ══════════════════════════════════════════════════════
-    def handle_default_drive(self, frame):
+    def handle_default_drive_1(self, frame):
         self._do_lane_follow(frame)
-        if self.yellow_line_count == 0:
-            next_state = Mission.YELLOW_STOP
-        elif self.yellow_line_count == 1:
-            next_state = Mission.ROUNDABOUT_WAIT
+        self._check_yellow(frame, Mission.YELLOW_STOP)
+
+    # ══════════════════════════════════════════════════════
+    # DEFAULT_DRIVE_2 : 박스 회피 후 ~ 교차로
+    # ══════════════════════════════════════════════════════
+    def handle_default_drive_2(self, frame):
+        self._do_lane_follow(frame)
+        self._check_yellow(frame, Mission.ROUNDABOUT_WAIT)
+
+    # ══════════════════════════════════════════════════════
+    # DEFAULT_DRIVE_3 : 콘 후 ~ 두 번째 박스
+    # ══════════════════════════════════════════════════════
+    def handle_default_drive_3(self, frame):
+        self._do_lane_follow(frame)
+        self._check_yellow(frame, Mission.OBSTACLE_AVOID_2)
+
+    # ══════════════════════════════════════════════════════
+    # OBSTACLE_AVOID : 박스 회피 (avoid_dir: -1=왼쪽, 1=오른쪽)
+    # ══════════════════════════════════════════════════════
+    def handle_obstacle_avoid(self, frame, avoid_dir):
+        elapsed = time.time() - self.state_enter_time
+
+        # 진입 후 OBS_START_DELAY초간 차선 추종
+        if elapsed < OBS_START_DELAY:
+            self._do_lane_follow(frame)
+            self.get_logger().info(f'[OBS] 감지 대기 중 {elapsed:.1f}/{OBS_START_DELAY}s', throttle_duration_sec=0.5)
+            return
+
+        # 박스 감지되면 회피 시작
+        if not hasattr(self, 'obs_avoid_start') or self.obs_avoid_start is None:
+            if self._detect_box_obstacle():
+                self.obs_avoid_start = time.time()
+                self.get_logger().info('[OBS] 박스 감지 → 회피 시작')
+            else:
+                self._do_lane_follow(frame)
+                self.get_logger().info('[OBS] 박스 대기 중', throttle_duration_sec=0.5)
+            return
+
+        avoid_elapsed = time.time() - self.obs_avoid_start
+
+        if avoid_elapsed < OBS_AVOID_SEC:
+            # 회피 중
+            cmd = Twist()
+            cmd.linear.x  = OBS_AVOID_SPEED
+            cmd.angular.z = OBS_AVOID_STEER * avoid_dir
+            self.cmd_pub.publish(cmd)
+            self.get_logger().info(f'[OBS] 회피 중 {avoid_elapsed:.1f}/{OBS_AVOID_SEC}s', throttle_duration_sec=0.3)
         else:
-            next_state = Mission.PARKING
-        self._check_yellow(frame, next_state)
+            # 회피 완료 → 복귀로 전환
+            self.obs_avoid_start = None
+            self.get_logger().info('[OBS] 회피 완료 → RETURN')
+            if self.state == Mission.OBSTACLE_AVOID:
+                self.transition_to(Mission.OBSTACLE_RETURN)
+            else:
+                self.transition_to(Mission.OBSTACLE_RETURN_2)
+
+    # ══════════════════════════════════════════════════════
+    # OBSTACLE_RETURN : 박스 회피 후 복귀
+    # ══════════════════════════════════════════════════════
+    def handle_obstacle_return(self, frame, return_dir, next_state):
+        elapsed = time.time() - self.state_enter_time
+        cmd = Twist()
+        cmd.linear.x  = OBS_AVOID_SPEED
+        cmd.angular.z = OBS_RETURN_STEER * return_dir
+        self.cmd_pub.publish(cmd)
+        self.get_logger().info(f'[OBS] 복귀 중 {elapsed:.1f}/{OBS_RETURN_SEC}s', throttle_duration_sec=0.3)
+
+        if elapsed >= OBS_RETURN_SEC:
+            self.get_logger().info(f'[OBS] 복귀 완료 → {next_state.name}')
+            self.transition_to(next_state)
 
     # ══════════════════════════════════════════════════════
     # YELLOW_STOP : 노란선 감지 후 DYN_WATCH_SEC초간 동적 장애물 감시
@@ -196,8 +288,8 @@ class MissionController(Node):
         elapsed = time.time() - self.state_enter_time
 
         if elapsed >= DYN_WATCH_SEC:
-            self.get_logger().info(f'[DYN_STOP] {DYN_WATCH_SEC}초 종료 → DEFAULT_DRIVE')
-            self.transition_to(Mission.DEFAULT_DRIVE)
+            self.get_logger().info(f'[DYN_STOP] {DYN_WATCH_SEC}초 종료 → OBSTACLE_AVOID')
+            self.transition_to(Mission.OBSTACLE_AVOID)
             return
 
         detected = False
@@ -331,11 +423,45 @@ class MissionController(Node):
 
         elapsed = time.time() - self.state_enter_time
         if (elapsed >= RETURN_MIN_TIME and centered) or elapsed >= RETURN_DURATION:
-            self.transition_to(Mission.DEFAULT_DRIVE)
+            self.transition_to(Mission.DEFAULT_DRIVE_3)
 
     # ══════════════════════════════════════════════════════
-    # 공통 차선 추종
+    # 박스 장애물 감지 (BoxOffice 로직)
     # ══════════════════════════════════════════════════════
+    def _detect_box_obstacle(self):
+        """반환값: 1=왼쪽편향, -1=오른쪽편향, 0=없음"""
+        if self.latest_scan is None:
+            return 0
+        msg = self.latest_scan
+        left_min  = float('inf')
+        right_min = float('inf')
+
+        for i, dist in enumerate(msg.ranges):
+            if not math.isfinite(dist):
+                continue
+            angle_rad = msg.angle_min + i * msg.angle_increment
+            angle_deg = math.degrees(angle_rad)
+            if abs(angle_deg) > BOX_FRONT_ANGLE:
+                continue
+            fwd = dist * math.cos(angle_rad)
+            lat = dist * math.sin(angle_rad)
+            if fwd <= 0.0 or abs(lat) > BOX_LANE_WIDTH:
+                continue
+            if lat >= 0.0:
+                left_min  = min(left_min,  fwd)
+            else:
+                right_min = min(right_min, fwd)
+
+        left_blocked  = left_min  < BOX_WARN_DIST
+        right_blocked = right_min < BOX_WARN_DIST
+
+        if left_blocked and not right_blocked:
+            return -1   # 오른쪽 편향
+        elif right_blocked and not left_blocked:
+            return 1    # 왼쪽 편향
+        elif left_blocked and right_blocked:
+            return 1 if left_min >= right_min else -1
+        return 0
     def _do_lane_follow(self, frame):
         bev = cv2.warpPerspective(frame, self.M, (self.BEV_W, self.BEV_H))
         bev_h, bev_w = bev.shape[:2]
@@ -424,16 +550,16 @@ class MissionController(Node):
     # ══════════════════════════════════════════════════════
     # 노란선 감지
     # ══════════════════════════════════════════════════════
-    def _check_yellow(self, frame, next_state):
+    def _check_yellow(self, frame, next_state, use_roi=True):
         # 쿨다운 중이면 감지 스킵
         if time.time() < self.yellow_cooldown_until:
             remaining = self.yellow_cooldown_until - time.time()
             self.get_logger().info(f'[YELLOW] 쿨다운 중 {remaining:.1f}s', throttle_duration_sec=1.0)
             return
 
-        # 원본 이미지 하단 30%에서 감지 (더 가까운 정지선만 감지)
+        # ROI 적용 여부
         h, w = frame.shape[:2]
-        roi  = frame[int(h*0.7):, :]
+        roi  = frame[int(h*0.7):, :] if use_roi else frame
         hsv  = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, YELLOW_LOW, YELLOW_HIGH)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -463,6 +589,10 @@ class MissionController(Node):
         self.state_enter_time = time.time()
         self.yellow_detected_ever = False
         self.yellow_gone_count    = 0
+        # 차선 추종 상태 리셋
+        self.prev_left_cx  = None
+        self.prev_right_cx = None
+        self.prev_waypoint = None
         if new_state == Mission.YELLOW_STOP:
             self.stop_clear_time = None
         if new_state == Mission.ROUNDABOUT_WAIT:
@@ -470,6 +600,8 @@ class MissionController(Node):
         if new_state == Mission.CONE_AVOIDING:
             self.cone_clear_count = 0
             self.avoid_dir        = None
+        if new_state in (Mission.OBSTACLE_AVOID, Mission.OBSTACLE_AVOID_2):
+            self.obs_avoid_start  = None
 
     def publish_stop(self):
         self.cmd_pub.publish(Twist())
